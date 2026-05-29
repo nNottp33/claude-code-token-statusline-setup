@@ -1,4 +1,4 @@
-# Claude Code Token Statusline — Windows installer
+﻿# Claude Code Token Statusline — Windows installer
 # Idempotent: safe to re-run. Merges settings.json instead of overwriting.
 # Usage:  powershell -ExecutionPolicy Bypass -File .\install-token-statusline.ps1
 
@@ -224,6 +224,10 @@ const burnStr = burnRatePerMin > 0 ? `${fmtK(burnRatePerMin)}/m` : '--';
 
 let etaMs  = Infinity;
 let isDead = false;
+// A DEAD verdict from rate extrapolation is only trustworthy once usage is
+// meaningful; below this a 2-sample %-delta over a short interval over-reacts
+// to one turn's burst and falsely flags DEAD with hours of runway left.
+const DEAD_MIN_PCT = 50;
 
 if (planPct >= 95) {
   isDead = true;
@@ -234,13 +238,13 @@ if (planPct >= 95) {
   const pctPerMin = dMin > 0 ? dPct / dMin : 0;
   if (pctPerMin > 0) {
     etaMs  = ((95 - usageLimitPct) / pctPerMin) * 60_000;
-    isDead = etaMs < resetMs;
+    isDead = etaMs < resetMs && planPct >= DEAD_MIN_PCT;
   }
 } else if (!hasLive && burnRatePerMin > 0) {
   const cutoff    = planLimit * 0.95;
   const remaining = cutoff - sessionTokensUsed;
   etaMs  = (remaining / burnRatePerMin) * 60_000;
-  isDead = etaMs < resetMs;
+  isDead = etaMs < resetMs && planPct >= DEAD_MIN_PCT;
 }
 
 const etaStr = fmtClock(etaMs, now);
@@ -270,7 +274,22 @@ const statusPart = isDead
   ? `${C.red}■ ${C.fg}Status ${C.bold}${C.red}✗ DEAD${C.reset}`
   : `${C.green}■ ${C.fg}Status ${C.bold}${C.green}● ALIVE${C.reset}`;
 
-process.stdout.write([tokenPart, statusPart, burnPart, ctxPart, etaPart, resetPart].join(SEP));
+// Responsive: pack segments onto as many lines as the terminal width needs.
+// Claude Code passes COLUMNS (so do interactive shells); fall back to 80.
+const cols   = (() => { const c = parseInt(process.env.COLUMNS, 10); return Number.isFinite(c) && c > 0 ? c : 80; })();
+const visLen = s => [...s.replace(/\x1b\[[0-9;]*m/g, '')].length;
+const sepLen = visLen(SEP);
+const parts  = [tokenPart, statusPart, burnPart, ctxPart, etaPart, resetPart];
+const lines  = [];
+let cur = '', curLen = 0;
+for (const p of parts) {
+  const pLen = visLen(p);
+  if (cur === '') { cur = p; curLen = pLen; }
+  else if (curLen + sepLen + pLen <= cols) { cur += SEP + p; curLen += sepLen + pLen; }
+  else { lines.push(cur); cur = p; curLen = pLen; }
+}
+if (cur !== '') lines.push(cur);
+process.stdout.write(lines.join('\n'));
 process.exit(0);
 '@
 [System.IO.File]::WriteAllText((Join-Path $scripts 'token-statusline.js'), $statuslineJs, $utf8NoBom)
@@ -454,6 +473,27 @@ $statusCmd    = "node $scriptsForward/token-statusline.js"
 $hookCmd      = "node $scriptsForward/update-token-state.js"
 & node $mergeTmp $settingsPath $statusCmd $hookCmd
 Remove-Item $mergeTmp
+
+# ── PowerShell profile integration (for Warp) ─────────────────────────────────
+$psProfile = $PROFILE.CurrentUserAllHosts
+$marker    = '# __claude-code-token-statusline__'
+$existing  = if (Test-Path $psProfile) { [System.IO.File]::ReadAllText($psProfile) } else { '' }
+if ($existing -notmatch [regex]::Escape($marker)) {
+  New-Item -ItemType File -Force -Path $psProfile | Out-Null
+  $snippet = @"
+
+$marker
+function prompt {
+    `$__ct = & node "`$HOME/.claude/scripts/token-statusline.js" 2>`$null
+    if (`$__ct) { Write-Host `$__ct }
+    "PS `$(`$executionContext.SessionState.Path.CurrentLocation)> "
+}
+"@
+  [System.IO.File]::AppendAllText($psProfile, $snippet, $utf8NoBom)
+  Write-Host "  Appended prompt integration to PowerShell profile ($psProfile)"
+} else {
+  Write-Host "  Skipped PowerShell profile (already patched)"
+}
 
 # ── Verify ────────────────────────────────────────────────────────────────────
 Write-Host ""
