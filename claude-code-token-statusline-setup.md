@@ -292,6 +292,10 @@ const burnStr = burnRatePerMin > 0 ? `${fmtK(burnRatePerMin)}/m` : '--';
 // Without: extrapolate from local tokens-per-min vs planLimit cutoff.
 let etaMs  = Infinity;
 let isDead = false;
+// A DEAD verdict from rate extrapolation is only trustworthy once usage is
+// meaningful; below this a 2-sample %-delta over a short interval over-reacts
+// to one turn's burst and falsely flags DEAD with hours of runway left.
+const DEAD_MIN_PCT = 50;
 
 if (planPct >= 95) {
   isDead = true;
@@ -302,13 +306,13 @@ if (planPct >= 95) {
   const pctPerMin = dMin > 0 ? dPct / dMin : 0;
   if (pctPerMin > 0) {
     etaMs  = ((95 - usageLimitPct) / pctPerMin) * 60_000;
-    isDead = etaMs < resetMs;
+    isDead = etaMs < resetMs && planPct >= DEAD_MIN_PCT;
   }
 } else if (!hasLive && burnRatePerMin > 0) {
   const cutoff    = planLimit * 0.95;
   const remaining = cutoff - sessionTokensUsed;
   etaMs  = (remaining / burnRatePerMin) * 60_000;
-  isDead = etaMs < resetMs;
+  isDead = etaMs < resetMs && planPct >= DEAD_MIN_PCT;
 }
 
 const etaStr = fmtClock(etaMs, now);
@@ -347,9 +351,22 @@ const statusPart = isDead
   ? `${C.red}■ ${C.fg}Status ${C.bold}${C.red}✗ DEAD${C.reset}`
   : `${C.green}■ ${C.fg}Status ${C.bold}${C.green}● ALIVE${C.reset}`;
 
-const line = [tokenPart, statusPart, burnPart, ctxPart, etaPart, resetPart].join(SEP);
-
-process.stdout.write(line);
+// Responsive: pack segments onto as many lines as the terminal width needs.
+// Claude Code passes COLUMNS (so do interactive shells); fall back to 80.
+const cols   = (() => { const c = parseInt(process.env.COLUMNS, 10); return Number.isFinite(c) && c > 0 ? c : 80; })();
+const visLen = s => [...s.replace(/\x1b\[[0-9;]*m/g, '')].length;
+const sepLen = visLen(SEP);
+const parts  = [tokenPart, statusPart, burnPart, ctxPart, etaPart, resetPart];
+const lines  = [];
+let cur = '', curLen = 0;
+for (const p of parts) {
+  const pLen = visLen(p);
+  if (cur === '') { cur = p; curLen = pLen; }
+  else if (curLen + sepLen + pLen <= cols) { cur += SEP + p; curLen += sepLen + pLen; }
+  else { lines.push(cur); cur = p; curLen = pLen; }
+}
+if (cur !== '') lines.push(cur);
+process.stdout.write(lines.join('\n'));
 process.exit(0);
 ```
 
@@ -684,7 +701,7 @@ remaining = cutoff − sessionTokensUsed
 etaMs     = remaining ÷ burnRatePerMin × 60 000
 ```
 
-`Status = DEAD` when `etaMs < resetMs` (limit hits 95% before reset window closes).
+`Status = DEAD` when `etaMs < resetMs` **and** usage is already past `DEAD_MIN_PCT` (50%) — the limit hits 95% before the reset window closes. Below 50% the rate is extrapolated from too few samples to trust, so the status stays ALIVE. A measured `planPct >= 95` is always DEAD regardless of the threshold.
 
 ---
 

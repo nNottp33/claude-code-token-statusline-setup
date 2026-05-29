@@ -221,6 +221,10 @@ const burnStr = burnRatePerMin > 0 ? `${fmtK(burnRatePerMin)}/m` : '--';
 
 let etaMs  = Infinity;
 let isDead = false;
+// A DEAD verdict from rate extrapolation is only trustworthy once usage is
+// meaningful; below this a 2-sample %-delta over a short interval over-reacts
+// to one turn's burst and falsely flags DEAD with hours of runway left.
+const DEAD_MIN_PCT = 50;
 
 if (planPct >= 95) {
   isDead = true;
@@ -231,13 +235,13 @@ if (planPct >= 95) {
   const pctPerMin = dMin > 0 ? dPct / dMin : 0;
   if (pctPerMin > 0) {
     etaMs  = ((95 - usageLimitPct) / pctPerMin) * 60_000;
-    isDead = etaMs < resetMs;
+    isDead = etaMs < resetMs && planPct >= DEAD_MIN_PCT;
   }
 } else if (!hasLive && burnRatePerMin > 0) {
   const cutoff    = planLimit * 0.95;
   const remaining = cutoff - sessionTokensUsed;
   etaMs  = (remaining / burnRatePerMin) * 60_000;
-  isDead = etaMs < resetMs;
+  isDead = etaMs < resetMs && planPct >= DEAD_MIN_PCT;
 }
 
 const etaStr = fmtClock(etaMs, now);
@@ -267,7 +271,22 @@ const statusPart = isDead
   ? `${C.red}■ ${C.fg}Status ${C.bold}${C.red}✗ DEAD${C.reset}`
   : `${C.green}■ ${C.fg}Status ${C.bold}${C.green}● ALIVE${C.reset}`;
 
-process.stdout.write([tokenPart, statusPart, burnPart, ctxPart, etaPart, resetPart].join(SEP));
+// Responsive: pack segments onto as many lines as the terminal width needs.
+// Claude Code passes COLUMNS (so do interactive shells); fall back to 80.
+const cols   = (() => { const c = parseInt(process.env.COLUMNS, 10); return Number.isFinite(c) && c > 0 ? c : 80; })();
+const visLen = s => [...s.replace(/\x1b\[[0-9;]*m/g, '')].length;
+const sepLen = visLen(SEP);
+const parts  = [tokenPart, statusPart, burnPart, ctxPart, etaPart, resetPart];
+const lines  = [];
+let cur = '', curLen = 0;
+for (const p of parts) {
+  const pLen = visLen(p);
+  if (cur === '') { cur = p; curLen = pLen; }
+  else if (curLen + sepLen + pLen <= cols) { cur += SEP + p; curLen += sepLen + pLen; }
+  else { lines.push(cur); cur = p; curLen = pLen; }
+}
+if (cur !== '') lines.push(cur);
+process.stdout.write(lines.join('\n'));
 process.exit(0);
 STATUSLINE_EOF
 
@@ -428,8 +447,20 @@ process.stdin.on('end', async () => {
 });
 HOOK_EOF
 
+# ── Resolve command strings (Windows Git Bash needs Windows paths + chcp) ───
+if [[ "${OSTYPE:-}" == "msys" || "${OSTYPE:-}" == "cygwin" ]]; then
+  SCRIPTS_NATIVE=$(cygpath -m "$SCRIPTS")
+  SETTINGS_NATIVE=$(cygpath -m "$CLAUDE/settings.json")
+  STATUS_CMD="cmd /d /c \"chcp 65001 >nul & node $SCRIPTS_NATIVE/token-statusline.js\""
+  HOOK_CMD="cmd /d /c \"chcp 65001 >nul & node $SCRIPTS_NATIVE/update-token-state.js\""
+else
+  SETTINGS_NATIVE="$CLAUDE/settings.json"
+  STATUS_CMD="node $SCRIPTS/token-statusline.js"
+  HOOK_CMD="node $SCRIPTS/update-token-state.js"
+fi
+
 # ── Merge settings.json via Node (idempotent, preserves existing keys) ──────
-node - "$CLAUDE/settings.json" "node $SCRIPTS/token-statusline.js" "node $SCRIPTS/update-token-state.js" <<'NODE_EOF'
+node - "$SETTINGS_NATIVE" "$STATUS_CMD" "$HOOK_CMD" <<'NODE_EOF'
 const fs = require('fs');
 const [,, p, sc, hc] = process.argv;
 let s = {};
@@ -441,6 +472,25 @@ s.hooks.Stop.push({ hooks: [{ type: 'command', command: hc }] });
 fs.writeFileSync(p, JSON.stringify(s, null, 2));
 console.log('settings.json merged');
 NODE_EOF
+
+# ── Warp / shell prompt integration ──────────────────────────────────────────
+BASHRC="$HOME/.bashrc"
+MARKER="# __claude-code-token-statusline__"
+if ! grep -qF "$MARKER" "$BASHRC" 2>/dev/null; then
+  {
+    printf '\n%s\n' "$MARKER"
+    cat <<'BASH_EOF'
+__claude_tokens() {
+  node "$HOME/.claude/scripts/token-statusline.js" 2>/dev/null
+  echo
+}
+PROMPT_COMMAND="${PROMPT_COMMAND:+${PROMPT_COMMAND}; }__claude_tokens"
+BASH_EOF
+  } >> "$BASHRC"
+  echo "  Appended prompt integration to $BASHRC (open a new shell to activate)"
+else
+  echo "  Skipped $BASHRC (already patched)"
+fi
 
 # ── Verify ───────────────────────────────────────────────────────────────────
 echo ""
