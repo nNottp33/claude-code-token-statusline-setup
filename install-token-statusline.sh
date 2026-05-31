@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Claude Code Token Statusline — macOS / Linux installer
+# Claude Code Token Statusline — macOS / Linux / Windows (Git Bash) installer
 # Idempotent: safe to re-run. Merges settings.json instead of overwriting.
 # Usage:  bash install-token-statusline.sh
 
@@ -200,6 +200,24 @@ if (!state || (now - (state.lastUpdated || 0)) > STATE_MAX_AGE) {
   state = scanCurrentSession(now);
 }
 
+// Background refresh: the Stop hook only updates the live API fields (Usage
+// Limit / ETA / Reset) at turn end, so they go stale during long turns and
+// while idle. When older than 60s, fire-and-forget a detached refresh (no
+// stdin) so the next render shows fresh data. A short lock debounces the
+// frequent re-renders so we never spawn a herd.
+const REFRESH_LOCK = path.join(CLAUDE_DIR, '.token-refresh.lock');
+const apiAge  = now - (state.usageLimitFetchedAt || 0);
+let   lockAge = Infinity;
+try { lockAge = now - fs.statSync(REFRESH_LOCK).mtimeMs; } catch (_) {}
+if (apiAge > 60_000 && lockAge > 20_000) {
+  try {
+    fs.writeFileSync(REFRESH_LOCK, String(now));
+    require('child_process').spawn(
+      process.execPath, [path.join(CLAUDE_DIR, 'scripts', 'update-token-state.js')],
+      { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+  } catch (_) {}
+}
+
 const planLimit = config.planTokenLimit || 900_000;
 const {
   sessionTokensUsed, burnRatePerMin, contextWindowUsed, windowEnd,
@@ -271,21 +289,26 @@ const statusPart = isDead
   ? `${C.red}■ ${C.fg}Status ${C.bold}${C.red}✗ DEAD${C.reset}`
   : `${C.green}■ ${C.fg}Status ${C.bold}${C.green}● ALIVE${C.reset}`;
 
-// Responsive: pack segments onto as many lines as the terminal width needs.
-// Claude Code passes COLUMNS (so do interactive shells); fall back to 80.
+// Fixed two-row layout (always stacked). Each row still wraps further if the
+// terminal is too narrow to hold it. Claude Code passes COLUMNS; fall back to 80.
 const cols   = (() => { const c = parseInt(process.env.COLUMNS, 10); return Number.isFinite(c) && c > 0 ? c : 80; })();
 const visLen = s => [...s.replace(/\x1b\[[0-9;]*m/g, '')].length;
 const sepLen = visLen(SEP);
-const parts  = [tokenPart, statusPart, burnPart, ctxPart, etaPart, resetPart];
+const rows   = [
+  [tokenPart, statusPart, burnPart],
+  [ctxPart, etaPart, resetPart],
+];
 const lines  = [];
-let cur = '', curLen = 0;
-for (const p of parts) {
-  const pLen = visLen(p);
-  if (cur === '') { cur = p; curLen = pLen; }
-  else if (curLen + sepLen + pLen <= cols) { cur += SEP + p; curLen += sepLen + pLen; }
-  else { lines.push(cur); cur = p; curLen = pLen; }
+for (const row of rows) {
+  let cur = '', curLen = 0;
+  for (const p of row) {
+    const pLen = visLen(p);
+    if (cur === '') { cur = p; curLen = pLen; }
+    else if (curLen + sepLen + pLen <= cols) { cur += SEP + p; curLen += sepLen + pLen; }
+    else { lines.push(cur); cur = p; curLen = pLen; }
+  }
+  if (cur !== '') lines.push(cur);
 }
-if (cur !== '') lines.push(cur);
 process.stdout.write(lines.join('\n'));
 process.exit(0);
 STATUSLINE_EOF
@@ -447,12 +470,15 @@ process.stdin.on('end', async () => {
 });
 HOOK_EOF
 
-# ── Resolve command strings (Windows Git Bash needs Windows paths + chcp) ───
+# ── Resolve command strings (Windows Git Bash needs Windows-style node paths) ──
+# Claude Code spawns statusLine/hook commands WITHOUT a shell, so the command
+# must be a plain `node <path>`. A cmd /d /c "..." wrapper fails to execute and
+# leaves the statusline blank and the Stop hook silent.
 if [[ "${OSTYPE:-}" == "msys" || "${OSTYPE:-}" == "cygwin" ]]; then
   SCRIPTS_NATIVE=$(cygpath -m "$SCRIPTS")
   SETTINGS_NATIVE=$(cygpath -m "$CLAUDE/settings.json")
-  STATUS_CMD="cmd /d /c \"chcp 65001 >nul & node $SCRIPTS_NATIVE/token-statusline.js\""
-  HOOK_CMD="cmd /d /c \"chcp 65001 >nul & node $SCRIPTS_NATIVE/update-token-state.js\""
+  STATUS_CMD="node $SCRIPTS_NATIVE/token-statusline.js"
+  HOOK_CMD="node $SCRIPTS_NATIVE/update-token-state.js"
 else
   SETTINGS_NATIVE="$CLAUDE/settings.json"
   STATUS_CMD="node $SCRIPTS/token-statusline.js"
@@ -472,25 +498,6 @@ s.hooks.Stop.push({ hooks: [{ type: 'command', command: hc }] });
 fs.writeFileSync(p, JSON.stringify(s, null, 2));
 console.log('settings.json merged');
 NODE_EOF
-
-# ── Warp / shell prompt integration ──────────────────────────────────────────
-BASHRC="$HOME/.bashrc"
-MARKER="# __claude-code-token-statusline__"
-if ! grep -qF "$MARKER" "$BASHRC" 2>/dev/null; then
-  {
-    printf '\n%s\n' "$MARKER"
-    cat <<'BASH_EOF'
-__claude_tokens() {
-  node "$HOME/.claude/scripts/token-statusline.js" 2>/dev/null
-  echo
-}
-PROMPT_COMMAND="${PROMPT_COMMAND:+${PROMPT_COMMAND}; }__claude_tokens"
-BASH_EOF
-  } >> "$BASHRC"
-  echo "  Appended prompt integration to $BASHRC (open a new shell to activate)"
-else
-  echo "  Skipped $BASHRC (already patched)"
-fi
 
 # ── Verify ───────────────────────────────────────────────────────────────────
 echo ""

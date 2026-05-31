@@ -203,6 +203,24 @@ if (!state || (now - (state.lastUpdated || 0)) > STATE_MAX_AGE) {
   state = scanCurrentSession(now);
 }
 
+// Background refresh: the Stop hook only updates the live API fields (Usage
+// Limit / ETA / Reset) at turn end, so they go stale during long turns and
+// while idle. When older than 60s, fire-and-forget a detached refresh (no
+// stdin) so the next render shows fresh data. A short lock debounces the
+// frequent re-renders so we never spawn a herd.
+const REFRESH_LOCK = path.join(CLAUDE_DIR, '.token-refresh.lock');
+const apiAge  = now - (state.usageLimitFetchedAt || 0);
+let   lockAge = Infinity;
+try { lockAge = now - fs.statSync(REFRESH_LOCK).mtimeMs; } catch (_) {}
+if (apiAge > 60_000 && lockAge > 20_000) {
+  try {
+    fs.writeFileSync(REFRESH_LOCK, String(now));
+    require('child_process').spawn(
+      process.execPath, [path.join(CLAUDE_DIR, 'scripts', 'update-token-state.js')],
+      { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+  } catch (_) {}
+}
+
 const planLimit = config.planTokenLimit || 900_000;
 const {
   sessionTokensUsed, burnRatePerMin, contextWindowUsed, windowEnd,
@@ -274,21 +292,26 @@ const statusPart = isDead
   ? `${C.red}■ ${C.fg}Status ${C.bold}${C.red}✗ DEAD${C.reset}`
   : `${C.green}■ ${C.fg}Status ${C.bold}${C.green}● ALIVE${C.reset}`;
 
-// Responsive: pack segments onto as many lines as the terminal width needs.
-// Claude Code passes COLUMNS (so do interactive shells); fall back to 80.
+// Fixed two-row layout (always stacked). Each row still wraps further if the
+// terminal is too narrow to hold it. Claude Code passes COLUMNS; fall back to 80.
 const cols   = (() => { const c = parseInt(process.env.COLUMNS, 10); return Number.isFinite(c) && c > 0 ? c : 80; })();
 const visLen = s => [...s.replace(/\x1b\[[0-9;]*m/g, '')].length;
 const sepLen = visLen(SEP);
-const parts  = [tokenPart, statusPart, burnPart, ctxPart, etaPart, resetPart];
+const rows   = [
+  [tokenPart, statusPart, burnPart],
+  [ctxPart, etaPart, resetPart],
+];
 const lines  = [];
-let cur = '', curLen = 0;
-for (const p of parts) {
-  const pLen = visLen(p);
-  if (cur === '') { cur = p; curLen = pLen; }
-  else if (curLen + sepLen + pLen <= cols) { cur += SEP + p; curLen += sepLen + pLen; }
-  else { lines.push(cur); cur = p; curLen = pLen; }
+for (const row of rows) {
+  let cur = '', curLen = 0;
+  for (const p of row) {
+    const pLen = visLen(p);
+    if (cur === '') { cur = p; curLen = pLen; }
+    else if (curLen + sepLen + pLen <= cols) { cur += SEP + p; curLen += sepLen + pLen; }
+    else { lines.push(cur); cur = p; curLen = pLen; }
+  }
+  if (cur !== '') lines.push(cur);
 }
-if (cur !== '') lines.push(cur);
 process.stdout.write(lines.join('\n'));
 process.exit(0);
 '@
@@ -473,27 +496,6 @@ $statusCmd    = "node $scriptsForward/token-statusline.js"
 $hookCmd      = "node $scriptsForward/update-token-state.js"
 & node $mergeTmp $settingsPath $statusCmd $hookCmd
 Remove-Item $mergeTmp
-
-# ── PowerShell profile integration (for Warp) ─────────────────────────────────
-$psProfile = $PROFILE.CurrentUserAllHosts
-$marker    = '# __claude-code-token-statusline__'
-$existing  = if (Test-Path $psProfile) { [System.IO.File]::ReadAllText($psProfile) } else { '' }
-if ($existing -notmatch [regex]::Escape($marker)) {
-  New-Item -ItemType File -Force -Path $psProfile | Out-Null
-  $snippet = @"
-
-$marker
-function prompt {
-    `$__ct = & node "`$HOME/.claude/scripts/token-statusline.js" 2>`$null
-    if (`$__ct) { Write-Host `$__ct }
-    "PS `$(`$executionContext.SessionState.Path.CurrentLocation)> "
-}
-"@
-  [System.IO.File]::AppendAllText($psProfile, $snippet, $utf8NoBom)
-  Write-Host "  Appended prompt integration to PowerShell profile ($psProfile)"
-} else {
-  Write-Host "  Skipped PowerShell profile (already patched)"
-}
 
 # ── Verify ────────────────────────────────────────────────────────────────────
 Write-Host ""
