@@ -499,10 +499,6 @@ fs.writeFileSync(p, JSON.stringify(s, null, 2));
 console.log('settings.json merged');
 NODE_EOF
 
-# ── Verify ───────────────────────────────────────────────────────────────────
-echo ""
-echo "Preview:"
-node "$SCRIPTS/token-statusline.js"
-echo ""
+# ── Done ─────────────────────────────────────────────────────────────────────
 echo ""
 echo "Installed. Restart Claude Code to see the statusline."

@@ -497,10 +497,6 @@ $hookCmd      = "node $scriptsForward/update-token-state.js"
 & node $mergeTmp $settingsPath $statusCmd $hookCmd
 Remove-Item $mergeTmp
 
-# ── Verify ────────────────────────────────────────────────────────────────────
-Write-Host ""
-Write-Host "Preview:"
-& node (Join-Path $scripts 'token-statusline.js')
-Write-Host ""
+# ── Done ──────────────────────────────────────────────────────────────────────
 Write-Host ""
 Write-Host "Installed. Restart Claude Code to see the statusline."
